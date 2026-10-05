@@ -417,6 +417,44 @@ type
     function INoGuidNamed.Name = NamedName;
   end;
 
+  // an interface without a GUID listed by a class and listed again by a descendant, to rebind its
+  // methods: both interface tables have an entry with the null GUID, for the same interface
+  INoGuidRelisted = interface
+    function Name: string;
+  end;
+
+  TRelistedBase = class(TInterfacedObject, INoGuidRelisted)
+  public
+    function Name: string;
+  end;
+
+  TRelistedDerived = class(TRelistedBase, INoGuidRelisted)
+  public
+    function Name: string;
+  end;
+
+  // a parent and a child interface, both without a GUID, both listed by the class (as a class
+  // does so that Supports also finds the parent)
+  INoGuidParent = interface
+    function ParentName: string;
+  end;
+
+  INoGuidChild = interface(INoGuidParent)
+    function ChildName: string;
+  end;
+
+  TParentAndChild = class(TInterfacedObject, INoGuidParent, INoGuidChild)
+  public
+    function ParentName: string;
+    function ChildName: string;
+  end;
+
+  // a factory of ILogger registered by hand, before RegisterSimpleFactory<ILogger,...>
+  TLoggerFactory = class(TInterfacedObject, IFactory<ILogger>)
+  public
+    function New: ILogger;
+  end;
+
   // hands out ILogger only through its own QueryInterface (ILogger is not in its interface
   // table), as a COM-style dynamic or delegating object does
   TDynamicLogger = class(TInterfacedObject, IInterface)
@@ -902,6 +940,23 @@ type
     procedure Test_DiagnoseConstructors_DynamicQueryInterface_IsAKnownLimit;
     [Test]
     procedure Test_Resolve_InterfaceWithoutGuid_NotAnotherInterface;
+    // findings of the audit of the follow-up (reproduced before fixing)
+    [Test]
+    procedure Test_Build_OwnedOfOverriddenRegistration_DoesNotFail;
+    [Test]
+    procedure Test_Build_SimpleFactoryOnTopOfOwnFactory_DoesNotFail;
+    [Test]
+    procedure Test_DiagnoseConstructors_StaleOwnedMessageNamesTheRegistration;
+    [Test]
+    procedure Test_Resolve_InterfaceWithoutGuid_RelistedInDescendant_Resolves;
+    [Test]
+    procedure Test_Resolve_InterfaceWithoutGuid_ParentAndChildListed_Resolve;
+    [Test]
+    procedure Test_Resolve_InterfaceWithoutGuid_NotImplemented_Refused;
+    [Test]
+    procedure Test_Resolve_InterfaceWithoutGuid_GivenSingleton_NotAnotherInterface;
+    [Test]
+    procedure Test_Scope_FreeThatRaises_LosesOnlyItsOwnMemory;
   end;
 
 implementation
@@ -2086,6 +2141,39 @@ end;
 constructor TCycleB.Create(a: ICycleA);
 begin
   inherited Create;
+end;
+
+{ TRelistedBase }
+
+function TRelistedBase.Name: string;
+begin
+  Result := 'base';
+end;
+
+{ TRelistedDerived }
+
+function TRelistedDerived.Name: string;
+begin
+  Result := 'derived';
+end;
+
+{ TParentAndChild }
+
+function TParentAndChild.ParentName: string;
+begin
+  Result := 'parent';
+end;
+
+function TParentAndChild.ChildName: string;
+begin
+  Result := 'child';
+end;
+
+{ TLoggerFactory }
+
+function TLoggerFactory.New: ILogger;
+begin
+  Result := TConsoleLogger.Create;
 end;
 
 { TTwoNoGuid }
@@ -3877,9 +3965,11 @@ begin
   Assert.IsTrue((FContainer.Resolve<IOwned<ILogger>>.Value as TObject) is TConsoleLogger,
     'Reproduction: IOwned<ILogger> wraps the registration the last one overrides');
   problems := FContainer.DiagnoseConstructors(warnings);
-  found := string.Join(' | ', problems);
+  found := string.Join(' | ', warnings);
   Assert.IsTrue((Pos('IOwned<', found) > 0) and (Pos('RegisterOwned<', found) > 0) and (Pos('TBuildCountedLogger', found) > 0),
-    'The diagnostics must report, as an error, the IOwned that does not wrap what Resolve returns. Found: ' + found);
+    'The diagnostics must warn about the IOwned that does not wrap what Resolve returns. Found: ' + found);
+  Assert.AreEqual(0, Integer(Length(problems)),
+    'A warning, not an error: it matters only if someone asks for IOwned<ILogger>. Found: ' + string.Join(' | ', problems));
 end;
 
 procedure TQuickIOCTests.Test_DiagnoseConstructors_DynamicQueryInterface_IsAKnownLimit;
@@ -3925,6 +4015,185 @@ begin
     Assert.AreEqual('INoGuidOther', other.Name,
       'Resolved, INoGuidOther must be the interface asked for, not another one without a GUID');
   end;
+end;
+
+{ Findings of the audit of the follow-up }
+
+procedure TQuickIOCTests.Test_Build_OwnedOfOverriddenRegistration_DoesNotFail;
+begin
+  // nobody asks for IOwned<ILogger>: a non-generic registration on top of a generic one is a valid
+  // configuration, and it passed Build with ValidateConstructors. The IOwned left behind is worth
+  // a warning, not a failed Build
+  FContainer.RegisterType<ILogger, TConsoleLogger>;
+  FContainer.RegisterType(TypeInfo(ILogger), TBuildCountedLogger);
+  FContainer.ValidateConstructors := True;
+  Assert.WillNotRaise(
+    procedure
+    begin
+      FContainer.Build;
+    end, nil, 'An IOwned left behind that nobody asks for must not make Build fail');
+end;
+
+procedure TQuickIOCTests.Test_Build_SimpleFactoryOnTopOfOwnFactory_DoesNotFail;
+begin
+  // RegisterSimpleFactory registers IFactory<ILogger> through the non-generic RegisterType, so a
+  // factory registered by hand before it leaves its IOwned<IFactory<ILogger>> behind
+  FContainer.RegisterType<IFactory<ILogger>, TLoggerFactory>;
+  FContainer.RegisterSimpleFactory<ILogger, TConsoleLogger>;
+  FContainer.ValidateConstructors := True;
+  Assert.WillNotRaise(
+    procedure
+    begin
+      FContainer.Build;
+    end, nil, 'RegisterSimpleFactory on top of a factory registered by hand must not make Build fail');
+end;
+
+procedure TQuickIOCTests.Test_DiagnoseConstructors_StaleOwnedMessageNamesTheRegistration;
+var
+  problems: TArray<string>;
+  warnings: TArray<string>;
+  found: string;
+begin
+  // for a named registration, RegisterOwned<ILogger> without the name targets another key: the
+  // message must name the registration
+  FContainer.RegisterType<ILogger, TConsoleLogger>('audit');
+  FContainer.RegisterType(TypeInfo(ILogger), TBuildCountedLogger, 'audit');
+  problems := FContainer.DiagnoseConstructors(warnings);
+  found := string.Join(' | ', problems + warnings);
+  Assert.IsTrue((Pos('RegisterOwned<', found) > 0) and (Pos('audit', found) > 0),
+    'The message must name the registration. Found: ' + found);
+end;
+
+procedure TQuickIOCTests.Test_Resolve_InterfaceWithoutGuid_RelistedInDescendant_Resolves;
+var
+  service: INoGuidRelisted;
+  error: string;
+begin
+  // one interface, listed by TRelistedBase and again by TRelistedDerived: QueryInterface with the
+  // null GUID finds the descendant's entry first, the right one, so this resolved before the
+  // ambiguity check. Counting null-GUID entries counts this interface twice
+  FContainer.RegisterType<INoGuidRelisted, TRelistedDerived>;
+  error := '';
+  try
+    service := FContainer.Resolve<INoGuidRelisted>;
+  except
+    on E: Exception do error := E.ClassName + ': ' + E.Message;
+  end;
+  Assert.AreEqual('', error, 'A single interface listed again by a descendant is not ambiguous');
+  Assert.AreEqual('derived', service.Name, 'The descendant''s binding must be used');
+end;
+
+procedure TQuickIOCTests.Test_Resolve_InterfaceWithoutGuid_ParentAndChildListed_Resolve;
+var
+  parent: INoGuidParent;
+  child: INoGuidChild;
+  error: string;
+begin
+  // both listed, child last: QueryInterface with the null GUID finds INoGuidChild first, which
+  // starts with INoGuidParent's methods, so both resolved correctly before the ambiguity check
+  FContainer.RegisterType<INoGuidParent, TParentAndChild>;
+  FContainer.RegisterType<INoGuidChild, TParentAndChild>;
+  error := '';
+  try
+    parent := FContainer.Resolve<INoGuidParent>;
+    child := FContainer.Resolve<INoGuidChild>;
+  except
+    on E: Exception do error := E.ClassName + ': ' + E.Message;
+  end;
+  Assert.AreEqual('', error, 'The interface found first is the one asked for, or a descendant of it: not ambiguous');
+  Assert.AreEqual('parent', parent.ParentName, 'INoGuidParent must work');
+  Assert.AreEqual('child', child.ChildName, 'INoGuidChild must work');
+end;
+
+procedure TQuickIOCTests.Test_Resolve_InterfaceWithoutGuid_NotImplemented_Refused;
+var
+  error: string;
+begin
+  // TNoGuidService implements only INoGuid. Registered for INoGuidOther, QueryInterface with the
+  // null GUID still answers, with INoGuid: another interface handed out as INoGuidOther, whose
+  // methods must not be called. Only one interface without a GUID, so the count lets it through
+  FContainer.RegisterType<INoGuidOther, TNoGuidService>;
+  error := '';
+  try
+    FContainer.Resolve<INoGuidOther>;
+  except
+    on E: Exception do error := E.ClassName + ': ' + E.Message;
+  end;
+  Assert.IsTrue(error.StartsWith('EIocRegisterError:') and (Pos('INoGuidOther has no GUID', error) > 0),
+    'An interface without a GUID that the class does not implement must be refused. Got: ' + error);
+end;
+
+procedure TQuickIOCTests.Test_Resolve_InterfaceWithoutGuid_GivenSingleton_NotAnotherInterface;
+var
+  given: INoGuidOther;
+  other: INoGuidOther;
+  error: string;
+begin
+  // an instance given to RegisterInstance<I> and resolved as a singleton never passes through
+  // BuildValue: only the check in ResolveSingleton sees it
+  given := TTwoNoGuid.Create;
+  FContainer.RegisterInstance<INoGuidOther>(given).AsSingleton;
+  error := '';
+  try
+    other := FContainer.Resolve<INoGuidOther>;
+  except
+    on E: Exception do error := E.ClassName + ': ' + E.Message;
+  end;
+  if error <> '' then
+    Assert.IsTrue(error.StartsWith('EIocRegisterError:') and (Pos('has no GUID', error) > 0),
+      'Refused, it must say why. Got: ' + error)
+  else
+    Assert.AreEqual('INoGuidOther', other.Name,
+      'Resolved, it must be the interface asked for, not another one without a GUID');
+end;
+
+// blocks allocated by the default memory manager
+function AllocatedBlocks: Int64;
+var
+  state: TMemoryManagerState;
+  i: Integer;
+begin
+  GetMemoryManagerState(state);
+  Result := Int64(state.AllocatedMediumBlockCount) + Int64(state.AllocatedLargeBlockCount);
+  for i := Low(state.SmallBlockTypeStates) to High(state.SmallBlockTypeStates) do
+    Inc(Result, Int64(state.SmallBlockTypeStates[i].AllocatedBlockCount));
+end;
+
+// resolved in a routine of its own: the compiler's temporary references to the result are
+// finalized on exit, so only the scope holds the instance afterwards
+procedure ResolveExplodingAndRelease(aScope: TIocScope);
+var
+  exploding: IExploding;
+begin
+  exploding := aScope.Resolve<IExploding>;
+end;
+
+procedure TQuickIOCTests.Test_Scope_FreeThatRaises_LosesOnlyItsOwnMemory;
+var
+  scope: TIocScope;
+  round: Integer;
+  before: Int64;
+  kept: Int64;
+begin
+  // a destructor that raises skips FreeInstance, and with it the finalization of the fields. When
+  // a scoped destructor raises, the scope's Free raises too: the instance and the scope's own
+  // memory are lost (two blocks), but not the lifetime marker the scope holds (it was a third)
+  FContainer.RegisterType<IExploding, TExplodingOnDestroy>.AsScoped;
+  kept := 0;
+  // the first round allocates what is allocated once (RTTI, monitors); the second is measured
+  for round := 1 to 2 do
+  begin
+    before := AllocatedBlocks;
+    scope := FContainer.CreateScope;
+    ResolveExplodingAndRelease(scope);
+    try
+      scope.Free;
+    except
+      on EExplodingDestroy do ;
+    end;
+    kept := AllocatedBlocks - before;
+  end;
+  Assert.AreEqual<Int64>(2, kept, 'Only the instance whose destructor raised and the scope itself may be lost');
 end;
 
 initialization
