@@ -399,6 +399,34 @@ type
     constructor Create(a: ICycleA);
   end;
 
+  // two interfaces declared without a GUID, with the same layout: both have the null GUID in the
+  // interface table
+  INoGuidOther = interface
+    function Name: string;
+  end;
+
+  INoGuidNamed = interface
+    function Name: string;
+  end;
+
+  TTwoNoGuid = class(TInterfacedObject, INoGuidOther, INoGuidNamed)
+  public
+    function OtherName: string;
+    function NamedName: string;
+    function INoGuidOther.Name = OtherName;
+    function INoGuidNamed.Name = NamedName;
+  end;
+
+  // hands out ILogger only through its own QueryInterface (ILogger is not in its interface
+  // table), as a COM-style dynamic or delegating object does
+  TDynamicLogger = class(TInterfacedObject, IInterface)
+  private
+    FInner: ILogger;
+  public
+    constructor Create;
+    function QueryInterface(const IID: TGUID; out Obj): HResult; stdcall;
+  end;
+
   // its constructor runs OnCreate, as Application.ProcessMessages runs a message handler while the
   // service is being built; the handler may resolve this same service again (re-entry, no cycle)
   IReentrant = interface
@@ -865,6 +893,15 @@ type
     procedure Test_Singleton_ClassDelegateReturnsNil_ResolvingKeepsNoMemory;
     [Test]
     procedure Test_Owned_GivenInstanceOnTop_OwnedWrapsIt;
+    // pending scenarios of the fourth review, reproduced after the pull request
+    [Test]
+    procedure Test_Resolve_InterfaceWithoutGuid_SingleOneStillResolves;
+    [Test]
+    procedure Test_DiagnoseConstructors_ReportsOwnedWrappingAnOverriddenRegistration;
+    [Test]
+    procedure Test_DiagnoseConstructors_DynamicQueryInterface_IsAKnownLimit;
+    [Test]
+    procedure Test_Resolve_InterfaceWithoutGuid_NotAnotherInterface;
   end;
 
 implementation
@@ -2049,6 +2086,32 @@ end;
 constructor TCycleB.Create(a: ICycleA);
 begin
   inherited Create;
+end;
+
+{ TTwoNoGuid }
+
+function TTwoNoGuid.OtherName: string;
+begin
+  Result := 'INoGuidOther';
+end;
+
+function TTwoNoGuid.NamedName: string;
+begin
+  Result := 'INoGuidNamed';
+end;
+
+{ TDynamicLogger }
+
+constructor TDynamicLogger.Create;
+begin
+  inherited Create;
+  FInner := TConsoleLogger.Create;
+end;
+
+function TDynamicLogger.QueryInterface(const IID: TGUID; out Obj): HResult;
+begin
+  if IsEqualGUID(IID, ILogger) then Result := FInner.QueryInterface(IID, Obj)
+    else Result := inherited QueryInterface(IID, Obj);
 end;
 
 { TReentrant }
@@ -3783,6 +3846,85 @@ begin
   Assert.IsTrue(FContainer.Resolve<ILogger> = mock, 'Resolve<ILogger> must return the given instance');
   consumer := FContainer.Resolve<IInjService>;
   Assert.IsTrue(consumer.Logger = mock, 'IOwned<ILogger> must wrap what Resolve<ILogger> returns: the given instance');
+end;
+
+{ Pending scenarios of the fourth review }
+
+procedure TQuickIOCTests.Test_Resolve_InterfaceWithoutGuid_SingleOneStillResolves;
+var
+  service: INoGuid;
+begin
+  // asked for with the null GUID, an interface without a GUID is found when it is the only one of
+  // its kind in the class: that keeps working, as it did before (DiagnoseConstructors reports the
+  // missing GUID). Only the ambiguous case is refused
+  FContainer.RegisterType<INoGuid, TNoGuidService>;
+  service := FContainer.Resolve<INoGuid>;
+  Assert.IsNotNull(service, 'The only interface without a GUID of the class must still resolve');
+  service.Run;
+end;
+
+procedure TQuickIOCTests.Test_DiagnoseConstructors_ReportsOwnedWrappingAnOverriddenRegistration;
+var
+  problems: TArray<string>;
+  warnings: TArray<string>;
+  found: string;
+begin
+  // the non-generic RegisterType cannot register IOwned: on top of RegisterType<I,T>, it is what
+  // Resolve<ILogger> returns, while IOwned<ILogger> still wraps the registration below it
+  FContainer.RegisterType<ILogger, TConsoleLogger>;
+  FContainer.RegisterType(TypeInfo(ILogger), TBuildCountedLogger);
+  Assert.IsTrue((FContainer.Resolve<ILogger> as TObject) is TBuildCountedLogger, 'Resolve<ILogger> returns the last registration');
+  Assert.IsTrue((FContainer.Resolve<IOwned<ILogger>>.Value as TObject) is TConsoleLogger,
+    'Reproduction: IOwned<ILogger> wraps the registration the last one overrides');
+  problems := FContainer.DiagnoseConstructors(warnings);
+  found := string.Join(' | ', problems);
+  Assert.IsTrue((Pos('IOwned<', found) > 0) and (Pos('RegisterOwned<', found) > 0) and (Pos('TBuildCountedLogger', found) > 0),
+    'The diagnostics must report, as an error, the IOwned that does not wrap what Resolve returns. Found: ' + found);
+end;
+
+procedure TQuickIOCTests.Test_DiagnoseConstructors_DynamicQueryInterface_IsAKnownLimit;
+var
+  problems: TArray<string>;
+  warnings: TArray<string>;
+begin
+  // a documented limit: TDynamicLogger hands out ILogger through its own QueryInterface, so it
+  // resolves, but the diagnostics read the interface table and report it as not implementing it
+  FContainer.RegisterType<ILogger, TDynamicLogger>;
+  Assert.IsNotNull(FContainer.Resolve<ILogger>, 'The registration resolves');
+  problems := FContainer.DiagnoseConstructors(warnings);
+  Assert.IsTrue((Length(problems) = 1) and (Pos('TDynamicLogger is registered for ILogger but does not implement it', problems[0]) > 0),
+    'The limit documented in DiagnoseConstructors. Found: ' + string.Join(' | ', problems));
+end;
+
+procedure TQuickIOCTests.Test_Resolve_InterfaceWithoutGuid_NotAnotherInterface;
+var
+  named: INoGuidNamed;
+  other: INoGuidOther;
+  error: string;
+begin
+  // the container gets the service interface with QueryInterface(its GUID); without a GUID it
+  // asks for the null GUID, which every interface declared without one shares, so the first of
+  // them found in the class answers. Asked for each of the two, at most one can be right.
+  // Refusing is acceptable; handing out another interface is not (it runs the wrong methods)
+  FContainer.RegisterType<INoGuidNamed, TTwoNoGuid>;
+  FContainer.RegisterType<INoGuidOther, TTwoNoGuid>;
+  error := '';
+  try
+    named := FContainer.Resolve<INoGuidNamed>;
+    other := FContainer.Resolve<INoGuidOther>;
+  except
+    on E: Exception do error := E.ClassName + ': ' + E.Message;
+  end;
+  if error <> '' then
+    Assert.IsTrue(error.StartsWith('EIocRegisterError:') and (Pos('has no GUID', error) > 0),
+      'Refused, it must say why. Got: ' + error)
+  else
+  begin
+    Assert.AreEqual('INoGuidNamed', named.Name,
+      'Resolved, INoGuidNamed must be the interface asked for, not another one without a GUID');
+    Assert.AreEqual('INoGuidOther', other.Name,
+      'Resolved, INoGuidOther must be the interface asked for, not another one without a GUID');
+  end;
 end;
 
 initialization

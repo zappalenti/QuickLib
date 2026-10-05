@@ -380,21 +380,25 @@ type
     /// registration added to the message; an exception raised by a constructor becomes an
     /// EIocBuildError, with the original one in InnerException.</summary>
     procedure Build;
-    /// <summary>Opens a new scope. The caller owns it and must free it.</summary>
+    /// <summary>Opens a new scope. The caller owns it and must free it before the container: a
+    /// scope, or a factory resolved from it, used after the container is freed reads freed memory.</summary>
     function CreateScope : TIocScope;
     /// <summary>Static check of the constructor each registration would use, without building
     /// anything. Reports classes that would be created by TObject.Create although they declare
     /// other constructors, classes none of whose own constructors is satisfiable, [Inject]
     /// constructors with unregistered parameters, constructors that ask for an unregistered
-    /// IOwned&lt;I&gt;, classes registered for an interface they do not implement, and interfaces
-    /// without a GUID. A registration that a later one of the same
+    /// IOwned&lt;I&gt;, an IOwned&lt;I&gt; that wraps a registration of I overridden by a later one
+    /// without its own IOwned, classes registered for an interface they do not implement, and
+    /// interfaces without a GUID. A registration that a later one of the same
     /// key overrides is never returned by Resolve: its problems are reported as warnings.
     /// Limits: it checks one level only (the parameters are registered, not that their own
     /// constructors can be satisfied), so a deeper dependency can still fail at runtime;
     /// [Inject] is only seen on public and published constructors (RTTI does not list the
     /// others); registrations with DelegateTo, factories and given instances are not checked; a
     /// TComponent descendant without a constructor of its own is reported, since
-    /// TComponent.Create(AOwner) is not satisfiable.</summary>
+    /// TComponent.Create(AOwner) is not satisfiable; a class that hands out the interface only
+    /// through its own QueryInterface (not in its interface table) is reported as not
+    /// implementing it, although it resolves.</summary>
     function DiagnoseConstructors : TArray<string>; overload;
     /// <summary>Same as DiagnoseConstructors, plus warnings, which do not make Build fail: the
     /// default rule picks an own constructor while another own constructor, also satisfiable,
@@ -561,6 +565,33 @@ begin
     [(aInstance as TObject).ClassName,aServiceType.Name,GUIDToString(GetTypeData(aServiceType).Guid)]);
 end;
 
+procedure RaiseIfGuidlessIsAmbiguous(const aInstance : IInterface; aServiceType : PTypeInfo);
+var
+  cls : TClass;
+  table : PInterfaceTable;
+  i : Integer;
+  guidless : Integer;
+begin
+  //an interface without a GUID is asked for with the null GUID, which every interface declared
+  //without one shares: QueryInterface answers with the first of them in the class. That is the
+  //right one only if the class implements a single interface without a GUID
+  if ifHasGuid in GetTypeData(aServiceType).IntfFlags then Exit;
+  guidless := 0;
+  cls := (aInstance as TObject).ClassType;
+  while cls <> nil do
+  begin
+    table := cls.GetInterfaceTable;
+    if table <> nil then
+      for i := 0 to table.EntryCount - 1 do
+        if IsEqualGUID(table.Entries[i].IID,TGUID.Empty) then Inc(guidless);
+    cls := cls.ClassParent;
+  end;
+  if guidless > 1 then
+    raise EIocRegisterError.CreateFmt('%s has no GUID and %s implements more than one interface without a GUID: the ' +
+      'container hands out interfaces by GUID and cannot tell them apart. Declare a GUID for %s',
+      [aServiceType.Name,(aInstance as TObject).ClassName,aServiceType.Name]);
+end;
+
 function IsOwnedType(aType : PTypeInfo) : Boolean;
 begin
   //every IOwned<T> has the GUID of the generic declaration: what tells them apart from other
@@ -661,7 +692,12 @@ end;
 
 class destructor TIocContainer.Destroy;
 begin
-  if GlobalInstance <> nil then GlobalInstance.Free;
+  //runs during finalization, where nothing can handle an exception: one raised by the destructor
+  //of a singleton would end the program with runtime error 217 instead
+  try
+    if GlobalInstance <> nil then GlobalInstance.Free;
+  except
+  end;
   inherited;
 end;
 
@@ -1483,6 +1519,8 @@ var
   warnings : TArray<string>;
   pass : Boolean;
   overridden : Boolean;
+  owned : TObjectList<TIocRegistration>;
+  targets : TObjectList<TIocRegistration>;
 
   //a registration that a later one of the same key overrides is never returned by Resolve, only
   //by ResolveAll: its problems are warnings, so a mock registered on top does not make Build fail
@@ -1498,6 +1536,8 @@ var
     if not (aReg is TIocRegistrationInterface) or (aReg.IntfInfo.Kind <> tkInterface) then Exit;
     if not (ifHasGuid in GetTypeData(aReg.IntfInfo).IntfFlags) then
       Problem(Format('%s has no GUID: the container hands out interfaces by GUID, declare one',[aReg.IntfInfo.Name]))
+    //the interface table, as the class declares it: a class that hands the interface out only
+    //through its own QueryInterface is reported too (a documented limit)
     else if aReg.&Implementation.GetInterfaceEntry(GetTypeData(aReg.IntfInfo).Guid) = nil then
       Problem(Format('%s is registered for %s but does not implement it',[aReg.&Implementation.ClassName,aReg.IntfInfo.Name]));
   end;
@@ -1629,6 +1669,23 @@ begin
   finally
     checked.Free;
   end;
+  //an IOwned<I> wraps the registration it was made for: when a later registration of I came
+  //without one (the non-generic RegisterType or RegisterInstance, Registrator), IOwned<I> hands
+  //out another implementation than Resolve<I>
+  for owned in fRegistrator.Dependencies.Values do
+  begin
+    if (owned.Count = 0) or (owned.Last.fOwnedTarget = nil) then Continue;
+    reg := owned.Last.fOwnedTarget;
+    for targets in fRegistrator.Dependencies.Values do
+      if targets.Contains(reg) then
+      begin
+        if targets.Last <> reg then
+          problems := problems + [Format('IOwned<%s> wraps %s, but Resolve<%s> returns %s, registered later without an ' +
+            'IOwned of its own: call RegisterOwned<%s> after registering it',
+            [reg.IntfInfo.Name,RegistrationLabel(reg),reg.IntfInfo.Name,RegistrationLabel(targets.Last),reg.IntfInfo.Name])];
+        Break;
+      end;
+  end;
   aWarnings := warnings;
   Result := problems;
 end;
@@ -1692,6 +1749,7 @@ begin
         newInst := Activate().AsInterface;
       end;
       if newInst = nil then raise EIocResolverError.CreateFmt('Implementation for "%s" not registered!',[aServiceType.Name]);
+      RaiseIfGuidlessIsAmbiguous(newInst,aServiceType);
       if newInst.QueryInterface(GetTypeData(aServiceType).Guid,intf) <> 0 then RaiseNotImplemented(newInst,aServiceType);
       TValue.Make(@intf,aServiceType,Result);
     end
@@ -1785,6 +1843,8 @@ begin
 
   if aReg is TIocRegistrationInterface then
   begin
+    //an instance given to RegisterInstance<I> never passes through BuildValue
+    RaiseIfGuidlessIsAmbiguous(IInterface(instance),aServiceType);
     if IInterface(instance).QueryInterface(GetTypeData(aServiceType).Guid,intf) <> 0 then
       RaiseNotImplemented(IInterface(instance),aServiceType);
     TValue.Make(@intf,aServiceType,Result);
